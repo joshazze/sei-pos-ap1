@@ -1,0 +1,228 @@
+//JOGO DA COBRINHA (NIBBLES) NA MATRIZ 8x8 DE WS2812B
+//Alunos: Joshua e Bruna
+//Sem biblioteca: nada de Adafruit NeoPixel. So o que ja foi usado nas aulas:
+//  pinMode, digitalWrite, Serial, delay, Timer1 por registrador com ISR e flag volatile,
+//  deslocamento e mascara de bit (<<, >>, &, |), arrays, switch.
+//Unica coisa nova: escrever direto no registrador PORT do pino e o nop (ver mostra).
+//
+//ROTEIRO (faz e testa nesta ordem, um bloco por vez)
+//  1. mostra(): acender UM LED de uma cor so. Sem isso nada mais da pra ver.
+//  2. pinta e limpa: acender o LED (x, y) que voce escolher.
+//  3. Timer1 de 10 ms: piscar um LED da matriz a cada 500 ms.
+//  4. teclado: imprimir na serial qual seta chegou.
+//  5. o jogo.
+//
+//TESTE DAS SETAS
+//O Serial Monitor da IDE nao manda seta. Fecha ele e usa o Terminal:
+//    screen /dev/cu.usbmodemXXXX 9600        (sair: Ctrl+A, K, y)
+//O porto aparece em: arduino-cli board list
+
+//=================================================================================
+//PINO E MATRIZ
+//TODO: #define do pino (6), NLEDS (64) e SERPENTINA (0), como no matriz_teclado.
+//
+//O pino 6 tambem e um bit de um registrador, igual ao WGM12 e o TCCR1B:
+//    Uno  (ATmega328P): bit 6 do PORTD
+//    Mega (ATmega2560): bit 3 do PORTH       <- a placa ligada no Mac e um Mega
+//TODO: #define pro registrador PORT e pro numero do bit.
+//
+//Brilho: sem a biblioteca nao existe setBrightness. O brilho e o proprio valor
+//da cor. 64 LEDs em 255 puxam mais de 3 A e a USB da 500 mA: usa valores ate uns 30.
+
+//=================================================================================
+//1. IMAGEM NA RAM
+//O que a Adafruit fazia por dentro (esta no comentario do matriz_teclado): um array
+//de 3 bytes por LED. Aqui voce guarda JA na ordem que o chip le.
+//Datasheet: "Follow the order of GRB to sent data and the high bit sent at first."
+//byte 0 do LED = verde, byte 1 = vermelho, byte 2 = azul.
+//TODO: array global de byte com NLEDS * 3 posicoes.
+
+//Copia a xy do matriz_teclado.
+int xy(int x, int y) {
+  //TODO
+}
+
+//O setPixelColor de voces: grava (r, g, b) do LED (x, y) no array, na ordem G R B.
+//So mexe na RAM, nao no fio.
+void pinta(int x, int y, byte r, byte g, byte b) {
+  //TODO
+}
+
+//O clear: zera o array inteiro.
+void limpa() {
+  //TODO
+}
+
+//=================================================================================
+//2. MOSTRA (o show de voces): o array vai pro fio
+//
+//O QUE O DATASHEET PEDE (tabela "Data transfer time", tolerancia +-150 ns)
+//    bit 0: 0,40 us em HIGH, 0,85 us em LOW
+//    bit 1: 0,80 us em HIGH, 0,45 us em LOW
+//    bit inteiro: 1,25 us (+-600 ns)
+//    reset: LOW por mais de 50 us, ai todos os LEDs mostram o que guardaram
+//
+//POR QUE O digitalWrite NAO SERVE
+//16 MHz = 62,5 ns por ciclo. 0,40 us = 6 ciclos. O digitalWrite procura o pino numa
+//tabela, desliga o PWM e so depois escreve: dezenas de ciclos, uns 5 us no Mega.
+//Mais lento que o bit inteiro.
+//
+//O QUE FAZER ENTAO
+//O digitalWrite, no fim, escreve 1 bit no registrador PORT. Voce pula o caminho e
+//escreve no PORT direto, como ja faz com TCCR1B e TIMSK1.
+//  - Antes do laco, ja com noInterrupts(), calcula dois bytes:
+//        hi = PORT com o bit do pino em 1      (mascara com |  e  <<)
+//        lo = PORT com o bit do pino em 0      (mascara com &  e  ~)
+//    No laco e so PORTx = hi ou PORTx = lo: uma escrita de 2 ciclos.
+//  - noInterrupts() no comeco e interrupts() no fim: a ISR do Timer1 (e o Timer0 do
+//    millis) no meio de um bit esticaria o HIGH e o LED leria errado.
+//  - Laco de fora: os NLEDS * 3 bytes. Laco de dentro: os 8 bits, do 7 pro 0.
+//    Testar o bit 7 e depois deslocar o byte (<< 1) e o mesmo que o shot faz com o >>.
+//
+//A ESPERA: nop
+//Mesmo escrevendo no PORT, o C sozinho e rapido demais: ligando e desligando sem
+//esperar, o HIGH dura 3 ciclos (187 ns, abaixo do minimo). Pra esperar uma quantidade
+//EXATA de ciclos existe o nop, instrucao que nao faz nada por 1 ciclo (62,5 ns):
+//    #define NOP asm volatile("nop")
+//Formato do bit, em C:
+//    fio HIGH
+//    NOP ... (quantos?)
+//    se o bit for 0: fio LOW
+//    NOP ... (quantos?)
+//    fio LOW
+//    desloca o byte
+//Custo em ciclos pra fazer a conta: escrita no PORT = 2, nop = 1,
+//teste do bit = 1 se nao pula a escrita, 3 se pula. Monte no papel a tabela de
+//ciclos do caminho do bit 0 e do bit 1, escolha os nops e deixe a tabela aqui no
+//comentario. O laco (contar bit, voltar) gasta mais uns 4 ciclos no LOW.
+//
+//RESET (pagina 4 do datasheet, "Data transmission method")
+//Um "Data refresh cycle" = os 64 x 24 bits seguidos, sem pausa, e depois o
+//"reset code": fio em LOW por >= 50 us. So no reset os LEDs trocam de cor juntos.
+//Depois do laco: fio em LOW e espera mais de 50 us. delay(1) (1 ms) serve e ja foi
+//usado em aula; o tempo extra nao estraga nada.
+//
+//CASCATA (pagina 4, "Cascade method")
+//O seu codigo so manda no D1 (DIN do primeiro LED). O LED 1 fica com os primeiros
+//24 bits e repassa o resto pelo DO; o LED 2 fica com os proximos 24, e assim por
+//diante. Por isso o primeiro trio do array e o LED 0 da fila.
+//
+//CONFERIR O QUE O COMPILADOR GEROU (a prova de que a conta vale):
+//    arduino-cli compile --fqbn arduino:avr:mega --output-dir /tmp/b cobrinha_matriz
+//    avr-objdump -d /tmp/b/cobrinha_matriz.ino.elf | grep -A20 "sts.*0x0102"
+//Cada "sts 0x0102" e uma escrita no PORTH. Conta os ciclos entre elas.
+void mostra() {
+  //TODO
+}
+
+//=================================================================================
+//3. RELOGIO: Timer1 com ISR, igual ao timer1_300ms e ao contador_botoes
+//Uma interrupcao a cada 10 ms. A ISR so liga uma flag volatile; quem anda a cobra
+//e o loop. Calcula prescaler e OCR1A pra 10 ms e deixa a conta no comentario,
+//como no timer1_300ms.
+//Detalhe: o mostra() desliga as interrupcoes por ~2 ms. Um tique que cair ali so
+//atrasa, nao se perde: a flag do hardware fica esperando o interrupts().
+
+//TODO: flag volatile do tique
+
+//TODO: ISR(TIMER1_COMPA_vect)
+
+//=================================================================================
+//SORTEIO DA COMIDA (sem random, que nao foi usado em aula)
+//Embaralhar com deslocamento e XOR, o mesmo tipo de operacao do shot:
+//    s ^= s << 7;   s ^= s >> 9;   s ^= s << 8;      (s do tipo unsigned int)
+//s nao pode ser 0 (fica 0 pra sempre). Pra cada partida sair diferente, mistura
+//o TCNT1 em s quando a primeira tecla chega: o contador muda a cada poucos us.
+//TODO: variavel da semente
+unsigned int sorteia() {
+  //TODO
+}
+
+//=================================================================================
+//5. O JOGO
+//ESTADO (globais)
+//  - cobra: arrays cobraX[NLEDS] e cobraY[NLEDS], indice 0 = cabeca, mais o tamanho.
+//  - direcao atual e proxima direcao (0 cima, 1 direita, 2 baixo, 3 esquerda).
+//    Tabela de deslocamento: dx = {0, 1, 0, -1}, dy = {-1, 0, 1, 0}.
+//    A oposta de d e (d + 2) % 4.
+//  - comida (x, y), pontos, velocidade (tiques por passo), contador de tiques,
+//    jogando ou esperando tecla.
+
+//(x, y) esta nas primeiras "ate" casas da cobra?
+bool na_cobra(int x, int y, int ate) {
+  //TODO
+}
+
+//Comida numa casa livre. Nao fica sorteando ate acertar (com a cobra grande isso
+//demora): conta as casas livres, sorteia k nesse intervalo, anda ate a k-esima livre.
+void nova_comida() {
+  //TODO
+}
+
+//limpa, pinta comida, corpo e cabeca (cor diferente pra ver pra onde ela vai), mostra.
+void desenha() {
+  //TODO
+}
+
+//Cobra de 3 casas no meio, indo pra direita. Zera pontos e velocidade, sorteia comida.
+void novo_jogo() {
+  //TODO
+}
+
+//Fim: pisca a matriz inteira (delay entre as piscadas serve, o jogo ja parou),
+//manda os pontos na Serial e volta pra espera.
+void acaba(bool ganhou) {
+  //TODO
+}
+
+//Um passo da cobra. A ordem importa:
+//  1. direcao = proxima
+//  2. casa nova da cabeca = cabeca + deslocamento
+//  3. saiu da matriz (menor que 0 ou maior que 7)? acaba
+//  4. comeu = casa nova e a comida
+//  5. bateu no corpo? CUIDADO: se nao comeu, o rabo sai do lugar neste mesmo passo,
+//     entao a ultima casa nao conta. Sem isso a cobra morre perseguindo o rabo.
+//  6. move: do rabo pra cabeca, cada casa recebe a anterior. Se comeu, aumenta o
+//     tamanho ANTES do laco: o rabo velho fica e vira o pedaco novo.
+//  7. se comeu: pontos, acelera (com limite), ganhou se encheu as 64, senao nova comida
+//  8. desenha
+void anda() {
+  //TODO
+}
+
+//=================================================================================
+//4. TECLADO (Serial.available e Serial.read, como no matriz_teclado)
+//No terminal cada seta chega como 3 bytes seguidos:
+//    ESC (27)  '['  letra       A = cima, B = baixo, C = direita, D = esquerda
+//(alguns terminais mandam 'O' no lugar do '['; aceitar os dois)
+//E uma maquina de estados, mesma ideia do switch de passos da casa_display:
+//    0: esperando. Chegou 27 -> 1. (W A S D aqui tambem, pra testar no Serial Monitor)
+//    1: chegou ESC. '[' ou 'O' -> 2. Qualquer outra coisa -> 0.
+//    2: chegou ESC [. A letra diz a seta. Volta pro 0.
+//Usa while (Serial.available() > 0), nao if: os 3 bytes chegam quase juntos.
+void le_teclado() {
+  //TODO
+}
+
+//Seta reconhecida.
+//  - Se nao esta jogando: mistura TCNT1 na semente e comeca o jogo.
+//  - Ignora a oposta a direcao ATUAL (nao a proxima): senao dois toques rapidos
+//    (cima e esquerda indo pra direita) fazem a cobra dar meia-volta e morrer.
+void tecla(int d) {
+  //TODO
+}
+
+//=================================================================================
+void setup() {
+  //TODO: Serial.begin(9600)
+  //TODO: pinMode do pino da matriz e comeca em LOW
+  //TODO: Timer1 de 10 ms (noInterrupts, TCCR1A, TCCR1B, TCNT1, OCR1A, WGM12,
+  //      prescaler, OCIE1A, interrupts)
+  //TODO: apaga a matriz, desenha a cobra parada, Serial.println("aperte uma seta")
+}
+
+void loop() {
+  //TODO: le_teclado() SEMPRE, fora do if da flag
+  //TODO: se a flag do tique ligou: apaga a flag; se jogando, conta;
+  //      quando o contador bater a velocidade, zera e anda()
+}
